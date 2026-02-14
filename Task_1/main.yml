@@ -1,0 +1,81 @@
+---
+- name: task1 - setup nginx
+  hosts: local
+  become: yes
+  gather_facts: False
+
+  pre_tasks:
+    - name: gather minimal facts
+      ansible.builtin.setup:
+        gather_subset: "!all,min"
+
+  tasks:
+    - name: install nginx
+      ansible.builtin.package:
+        name: nginx
+        state: present
+      tags: nginx
+
+    - name: create html directory
+      ansible.builtin.file:
+        path: /var/www/html
+        state: directory
+        mode: '0755'
+        owner: http
+        group: http
+
+    - name: create files directory
+      ansible.builtin.file:
+        path: /var/www/html/files
+        state: directory
+        mode: '0755'
+        owner: http
+        group: http
+
+    - name: create test files
+      ansible.builtin.copy:
+        content: "test file number {{ item }}\n"
+        dest: "/var/www/html/files/{{ item }}.txt"
+        mode: '0644'
+        owner: http
+        group: http
+      loop: [1, 2, 3]
+
+    - name: create subfolder
+      ansible.builtin.file:
+        path: /var/www/html/files/subfolder
+        state: directory
+        mode: '0755'
+        owner: http
+        group: http
+
+    - name: create file in subfolder
+      ansible.builtin.copy:
+        content: "file in subfolder\n"
+        dest: "/var/www/html/files/subfolder/test.txt"
+        mode: '0644'
+        owner: http
+        group: http
+
+    - name: deploy nginx config
+      ansible.builtin.template:
+        src: templates/web-nginx.conf
+        dest: /etc/nginx/nginx.conf
+      notify:
+        - test nginx config
+        - restart nginx
+
+    - name: ensure nginx is running
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: yes
+
+  handlers:
+    - name: test nginx config
+      ansible.builtin.command: nginx -t
+
+    - name: restart nginx
+      ansible.builtin.service:
+        name: nginx
+        state: restarted
