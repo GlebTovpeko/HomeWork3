@@ -1,0 +1,183 @@
+---
+- name: Install and initialize PostgreSQL 16
+  hosts: postgres_servers
+  become: true
+  vars:
+    postgresql_version: "16"
+    pg_data_dir: "/pg_data/16"
+    pg_conf_dir: "/etc/postgresql/{{ postgresql_version }}/main"
+
+  tasks:
+    # ========================================================================
+    # 1. Подготовка репозитория PostgreSQL
+    # ========================================================================
+    - name: Install required packages for adding repository
+      apt:
+        name:
+          - gnupg
+          - curl
+          - apt-transport-https
+          - ca-certificates
+        state: present
+        update_cache: true
+
+    - name: Create directory for APT keyrings
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Download PostgreSQL repository GPG key
+      get_url:
+        url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+        dest: /etc/apt/keyrings/postgresql.asc
+        mode: '0644'
+
+    - name: Add PostgreSQL APT repository
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/postgresql.asc] http://apt.postgresql.org/pub/repos/apt {{ ansible_facts['distribution_release'] }}-pgdg main"
+        state: present
+        filename: postgresql
+
+    - name: Update apt cache after adding repository
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    # ========================================================================
+    # 2. Установка пакетов PostgreSQL
+    # ========================================================================
+    - name: Install PostgreSQL packages
+      apt:
+        name:
+          - postgresql
+          - postgresql-contrib
+          - postgresql-{{ postgresql_version }}
+          - postgresql-client-{{ postgresql_version }}
+        state: present
+
+    # ========================================================================
+    # 3. Подготовка директории данных
+    # ========================================================================
+    - name: Create PostgreSQL data directory
+      file:
+        path: "{{ pg_data_dir }}"
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0700'
+
+    - name: Ensure data directory ownership
+      file:
+        path: "{{ pg_data_dir }}"
+        owner: postgres
+        group: postgres
+        mode: '0700'
+        recurse: true
+
+    # ========================================================================
+    # 4. Удаление кластера по умолчанию (если есть)
+    # ========================================================================
+    - name: Check if default cluster exists
+      command: pg_lsclusters
+      register: cluster_check
+      changed_when: false
+      failed_when: false
+
+    - name: Stop default PostgreSQL cluster if running
+      command: pg_ctlcluster {{ postgresql_version }} main stop
+      when: cluster_check.stdout is search('main')
+      ignore_errors: true
+
+    - name: Drop default cluster
+      command: pg_dropcluster {{ postgresql_version }} main --stop
+      when: cluster_check.stdout is search('main')
+      ignore_errors: true
+
+    # ========================================================================
+    # 5. Создание кластера с кастомной директорией
+    # ========================================================================
+    - name: Create new cluster with custom data directory
+      command: >
+        pg_createcluster {{ postgresql_version }} main
+        -d {{ pg_data_dir }}
+        -e UTF8
+        --locale=C
+      args:
+        creates: "{{ pg_conf_dir }}/postgresql.conf"
+
+    # ========================================================================
+    # 6. Настройка postgresql.conf
+    # ========================================================================
+    - name: Configure postgresql.conf - listen_addresses
+      lineinfile:
+        path: "{{ pg_conf_dir }}/postgresql.conf"
+        regexp: "^#?listen_addresses"
+        line: "listen_addresses = '*'"
+        state: present
+
+    - name: Configure postgresql.conf - port
+      lineinfile:
+        path: "{{ pg_conf_dir }}/postgresql.conf"
+        regexp: "^#?port"
+        line: "port = 5432"
+        state: present
+
+    - name: Configure postgresql.conf - data_directory
+      lineinfile:
+        path: "{{ pg_conf_dir }}/postgresql.conf"
+        regexp: "^#?data_directory"
+        line: "data_directory = '{{ pg_data_dir }}'"
+        state: present
+
+    # ========================================================================
+    # 7. Настройка pg_hba.conf
+    # ========================================================================
+    - name: Configure pg_hba.conf for access
+      blockinfile:
+        path: "{{ pg_conf_dir }}/pg_hba.conf"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK"
+        block: |
+          local   all             postgres                                peer
+          local   all             all                                     peer
+          host    all             all             127.0.0.1/32            scram-sha-256
+          host    all             all             ::1/128                 scram-sha-256
+          host    all             all             0.0.0.0/0               scram-sha-256
+
+    # ========================================================================
+    # 8. Запуск службы PostgreSQL
+    # ========================================================================
+    - name: Remove unused PostgreSQL 18 cluster
+      command: pg_dropcluster 18 main --stop
+      ignore_errors: true
+
+    - name: Start PostgreSQL cluster
+      command: pg_ctlcluster {{ postgresql_version }} main start
+
+    - name: Enable PostgreSQL autostart
+      systemd:
+        name: postgresql
+        enabled: true
+
+    - name: Wait for PostgreSQL to be ready
+      wait_for:
+        port: 5432
+        timeout: 30
+
+    - name: Verify PostgreSQL is running
+      command: pg_isready
+      register: pg_status
+      changed_when: false
+
+    - name: Display PostgreSQL status
+      debug:
+        msg: "PostgreSQL is {{ 'running' if pg_status.rc == 0 else 'not running' }}"
+
+    # ========================================================================
+    # 9. Установка пароля для пользователя postgres
+    # ========================================================================
+    - name: Set password for postgres user
+      become: true
+      shell: |
+        su - postgres -c "psql -c \"ALTER USER postgres WITH PASSWORD '{{ postgresql_password }}'\""
+      no_log: true
