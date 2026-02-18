@@ -1,0 +1,7 @@
+# Никогда не коммитить:
+.vault_pass
+*.key
+*.pem
+.env
+__pycache__/
+*.pyc
