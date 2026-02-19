@@ -249,3 +249,161 @@
     - name: Final Status
       debug:
         msg: "Task 1 completed successfully! User {{ bench_user }}, DB {{ bench_db }}, Replication user {{ replication_user }} created."
+
+    # ========================================================================
+    # БЛОК ДЛЯ ОТЧЕТА
+    # ========================================================================
+    - name: "[REPORT] Show users and databases"
+      become_user: postgres
+      command: psql -c "\du"
+      register: report_users
+      changed_when: false
+
+    - name: "[REPORT] Display Users (for screenshot)"
+      debug:
+        msg: "{{ report_users.stdout_lines }}"
+
+    - name: "[REPORT] Show databases"
+      become_user: postgres
+      command: psql -c "\l"
+      register: report_dbs
+      changed_when: false
+
+    - name: "[REPORT] Display Databases (for screenshot)"
+      debug:
+        msg: "{{ report_dbs.stdout_lines }}"
+
+    - name: "[REPORT] Show installed extensions"
+      become_user: postgres
+      command: psql -d {{ bench_db }} -c "SELECT extname, extversion FROM pg_extension WHERE extname IN ('pg_stat_statements', 'pg_buffercache', 'pg_wait_sampling');"
+      register: report_extensions
+      changed_when: false
+
+    - name: "[REPORT] Display Extensions (for screenshot)"
+      debug:
+        msg: "{{ report_extensions.stdout_lines }}"
+
+    - name: "[REPORT] Check logging config"
+      become_user: postgres
+      command: psql -c "SHOW log_statement; SHOW log_duration;"
+      register: report_logging
+      changed_when: false
+
+    - name: "[REPORT] Display Logging Config (for screenshot)"
+      debug:
+        msg: "{{ report_logging.stdout_lines }}"
+
+    - name: "[REPORT] Run pgbench for report data"
+      become_user: postgres
+      command: pgbench -c 2 -j 1 -t 50 {{ bench_db }}
+      register: report_pgbench_run
+      changed_when: false
+      ignore_errors: true
+
+    - name: "[REPORT] Display pgbench results (for screenshot)"
+      debug:
+        msg: "{{ report_pgbench_run.stdout_lines }}"
+
+    - name: "[REPORT] Top 5 IO Heavy Queries"
+      become_user: postgres
+      command: >
+        psql -d {{ bench_db }} -c "
+        SELECT substring(query, 1, 60) as query_short, calls, 
+               round(blk_write_time::numeric, 2) as write_ms
+        FROM pg_stat_statements 
+        ORDER BY blk_write_time DESC NULLS LAST 
+        LIMIT 5;"
+      register: report_top_io
+      changed_when: false
+
+    - name: "[REPORT] Display Top IO Queries (for screenshot)"
+      debug:
+        msg: "{{ report_top_io.stdout_lines }}"
+
+    - name: "[REPORT] Top 5 Longest Queries"
+      become_user: postgres
+      command: >
+        psql -d {{ bench_db }} -c "
+        SELECT substring(query, 1, 60) as query_short, calls, 
+               round(total_exec_time::numeric, 2) as total_ms
+        FROM pg_stat_statements 
+        ORDER BY total_exec_time DESC 
+        LIMIT 5;"
+      register: report_top_time
+      changed_when: false
+
+    - name: "[REPORT] Display Top Time Queries (for screenshot)"
+      debug:
+        msg: "{{ report_top_time.stdout_lines }}"
+
+    - name: "[REPORT] Extract pgbench logs"
+      shell: |
+        grep "pgbench" /var/log/postgresql/postgresql-{{ postgresql_version }}-main.log | tail -n 10
+      register: report_logs
+      changed_when: false
+      ignore_errors: true
+
+    - name: "[REPORT] Display Logs (for screenshot)"
+      debug:
+        msg: "{{ report_logs.stdout_lines }}"
+
+    - name: "[REPORT] Show replication user"
+      become_user: postgres
+      command: psql -c "\du replicator"
+      register: report_repl_user
+      changed_when: false
+
+    - name: "[REPORT] Display Replication User (for screenshot)"
+      debug:
+        msg: "{{ report_repl_user.stdout_lines }}"
+
+    - name: "[REPORT] Show pg_hba.conf replication rules"
+      command: grep -E "replication|{{ replication_user }}" {{ pg_conf_dir }}/pg_hba.conf
+      register: report_hba
+      changed_when: false
+
+    - name: "[REPORT] Display HBA Rules (for screenshot)"
+      debug:
+        msg: "{{ report_hba.stdout_lines }}"
+
+    - name: Save full report to local file
+      become: false
+      local_action:
+        module: copy
+        content: |
+          === ОТЧЕТ ПО TASK 1 ===
+          Дата: {{ ansible_date_time.iso8601 }}
+          Хост: {{ inventory_hostname }}
+
+          --- 1. Пользователи ---
+          {{ report_users.stdout }}
+
+          --- 2. Базы данных ---
+          {{ report_dbs.stdout }}
+
+          --- 3. Расширения ---
+          {{ report_extensions.stdout }}
+
+          --- 4. Настройки логирования ---
+          {{ report_logging.stdout }}
+
+          --- 5. Результаты pgbench ---
+          {{ report_pgbench_run.stdout }}
+
+          --- 6. Топ запросов (IO) ---
+          {{ report_top_io.stdout }}
+
+          --- 7. Топ запросов (Время) ---
+          {{ report_top_time.stdout }}
+
+          --- 8. Логи ---
+          {{ report_logs.stdout | default('Нет записей') }}
+
+          --- 9. Пользователь репликации ---
+          {{ report_repl_user.stdout }}
+
+          --- 10. Правила доступа ---
+          {{ report_hba.stdout }}
+        dest: "./report_{{ inventory_hostname }}_{{ ansible_date_time.date }}.txt"
+      run_once: true
+      delegate_to: localhost
