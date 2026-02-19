@@ -102,7 +102,7 @@ systemctl status postgresql@16-one-base.service
 # Проверка слушающих портов
 ss -tlnp | grep 5433
 ```
-![alt text](image.png)
+![alt text](photos/image.png)
 
 ### 4.3. Создание слота и публикации (Пункт 3.1)
 
