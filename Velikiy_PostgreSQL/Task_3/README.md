@@ -135,7 +135,8 @@ PUBLICATION my_publication;
 SELECT subname, subenabled, subslotname FROM pg_subscription;
 -- Результат: subenabled = t (активна)
 ```
-![alt text](image.png)
+
+![alt text](photos/image-2.png)
 
 ### 4.5. Тестирование синхронизации данных
 
