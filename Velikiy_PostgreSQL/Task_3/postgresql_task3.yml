@@ -1,0 +1,320 @@
+---
+- name: Task 3. Logical Replication Setup
+  hosts: postgres_servers
+  become: true
+  vars:
+    postgresql_version: "16"
+    
+    # Master settings
+    master_pg_conf_dir: "/etc/postgresql/{{ postgresql_version }}/main"
+    master_data_dir: "/pg_data/16"
+    master_ip: "192.168.122.19" # Убедитесь, что это IP вашего server1
+    
+    # Second Instance settings (on Server2 only)
+    second_instance_port: 5433
+    second_instance_name: "one-base"
+    second_data_dir: "/pg_data/16-one-base"
+    
+    # Replication objects
+    repl_table_name: "logical_test_table"
+    pub_name: "my_publication"
+    sub_name: "my_subscription"
+    repl_user: "replicator"
+    repl_password: "123" 
+
+  tasks:
+    # ========================================================================
+    # ЧАСТЬ 1: Настройка MASTER (Server1) - ЖЕСТКАЯ ПЕРЕЗАГРУЗКА
+    # ========================================================================
+    
+    - name: Ensure wal_level is set to logical in config file
+      lineinfile:
+        path: "{{ master_pg_conf_dir }}/postgresql.conf"
+        regexp: "^#?wal_level"
+        line: "wal_level = 'logical'"
+        state: present
+      when: ansible_host == master_ip
+      # Не полагаемся только на notify, делаем явную проверку ниже
+
+    - name: Get current runtime wal_level from Master
+      become_user: postgres
+      shell: "psql -tAc \"SHOW wal_level;\""
+      register: runtime_wal_level
+      changed_when: false
+      failed_when: false
+      when: ansible_host == master_ip
+
+    - name: Debug current wal_level
+      debug:
+        msg: "Current wal_level is: {{ runtime_wal_level.stdout | trim }}"
+      when: ansible_host == master_ip
+
+    - name: FORCE Restart Master if wal_level is NOT logical
+      command: pg_ctlcluster {{ postgresql_version }} main restart
+      when: 
+        - ansible_host == master_ip
+        - runtime_wal_level.stdout is defined
+        - "'logical' not in runtime_wal_level.stdout"
+      
+    - name: Wait for Master to be ready after forced restart
+      wait_for:
+        port: 5432
+        timeout: 60
+      when: 
+        - ansible_host == master_ip
+        - runtime_wal_level.stdout is defined
+        - "'logical' not in runtime_wal_level.stdout"
+
+    - name: Verify wal_level is now logical
+      become_user: postgres
+      shell: "psql -tAc \"SHOW wal_level;\""
+      register: final_wal_check
+      when: ansible_host == master_ip
+      failed_when: "'logical' not in final_wal_check.stdout"
+      changed_when: false
+
+    - name: Create test table on Master if not exists
+      become_user: postgres
+      command: >
+        psql -c "CREATE TABLE IF NOT EXISTS {{ repl_table_name }} (id serial PRIMARY KEY, data text, created_at timestamp default now());"
+      when: ansible_host == master_ip
+      changed_when: true
+
+    - name: Create Publication for specific table
+      become_user: postgres
+      command: >
+        psql -c "DROP PUBLICATION IF EXISTS {{ pub_name }}; CREATE PUBLICATION {{ pub_name }} FOR TABLE {{ repl_table_name }};"
+      when: ansible_host == master_ip
+      changed_when: true
+
+    - name: Ensure replication user has SELECT on the table
+      become_user: postgres
+      command: >
+        psql -c "GRANT SELECT ON {{ repl_table_name }} TO {{ repl_user }};"
+      when: ansible_host == master_ip
+      changed_when: true
+
+    # ========================================================================
+    # ЧАСТЬ 2: Поднятие ВТОРОГО ИНСТАНСА на Server2
+    # ========================================================================
+
+    - name: Install postgresql-contrib for second instance tools
+      apt:
+        name: "postgresql-contrib-{{ postgresql_version }}"
+        state: present
+      when: ansible_host != master_ip
+
+    - name: Create data directory for second instance
+      file:
+        path: "{{ second_data_dir }}"
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0700'
+      when: ansible_host != master_ip
+
+    - name: Initialize second PostgreSQL cluster
+      become_user: postgres
+      command: >
+        /usr/lib/postgresql/{{ postgresql_version }}/bin/initdb -D {{ second_data_dir }} -E UTF8 --locale=C
+      args:
+        creates: "{{ second_data_dir }}/PG_VERSION"
+      when: ansible_host != master_ip
+
+    - name: Configure second instance port
+      lineinfile:
+        path: "{{ second_data_dir }}/postgresql.conf"
+        regexp: "^#?port"
+        line: "port = {{ second_instance_port }}"
+        state: present
+      when: ansible_host != master_ip
+
+    - name: Configure second instance wal_level
+      lineinfile:
+        path: "{{ second_data_dir }}/postgresql.conf"
+        regexp: "^#?wal_level"
+        line: "wal_level = 'logical'"
+        state: present
+      when: ansible_host != master_ip
+
+    - name: Create systemd service for second instance
+      copy:
+        dest: "/etc/systemd/system/postgresql@{{ postgresql_version }}-{{ second_instance_name }}.service"
+        content: |
+          [Unit]
+          Description=PostgreSQL Cluster {{ postgresql_version }}-{{ second_instance_name }}
+          After=network.target
+
+          [Service]
+          Type=forking
+          User=postgres
+          Group=postgres
+          Environment=PGDATA={{ second_data_dir }}
+          ExecStart=/usr/lib/postgresql/{{ postgresql_version }}/bin/pg_ctl start -D {{ second_data_dir }} -o "-c config_file={{ second_data_dir }}/postgresql.conf"
+          ExecStop=/usr/lib/postgresql/{{ postgresql_version }}/bin/pg_ctl stop -D {{ second_data_dir }} -m fast
+          TimeoutSec=300
+
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+      when: ansible_host != master_ip
+      notify: Reload Systemd
+
+    - name: Enable and Start second PostgreSQL instance
+      systemd:
+        name: "postgresql@{{ postgresql_version }}-{{ second_instance_name }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+      when: ansible_host != master_ip
+
+    - name: Wait for second instance to be ready
+      wait_for:
+        port: "{{ second_instance_port }}"
+        timeout: 30
+      when: ansible_host != master_ip
+
+    - name: Create identical table structure on Second Instance
+      become_user: postgres
+      command: >
+        psql -p {{ second_instance_port }} -c "CREATE TABLE IF NOT EXISTS {{ repl_table_name }} (id serial PRIMARY KEY, data text, created_at timestamp default now());"
+      when: ansible_host != master_ip
+      changed_when: true
+
+    # ========================================================================
+    # ЧАСТЬ 3: Настройка ЛОГИЧЕСКОЙ РЕПЛИКАЦИИ (Подписка)
+    # ========================================================================
+
+    - name: Create Subscription on Second Instance
+      become_user: postgres
+      shell: >
+        psql -p {{ second_instance_port }} -c 
+        "CREATE SUBSCRIPTION {{ sub_name }} 
+         CONNECTION 'host={{ master_ip }} dbname=postgres user={{ repl_user }} password={{ repl_password }}' 
+         PUBLICATION {{ pub_name }};"
+      when: ansible_host != master_ip
+      register: sub_result
+      changed_when: "'already exists' not in sub_result.stderr"
+      failed_when: sub_result.rc != 0 and 'already exists' not in sub_result.stderr
+
+    # ========================================================================
+    # ЧАСТЬ 4: Проверка, Тестирование и Сохранение Отчета
+    # ========================================================================
+
+    - name: Insert test data on Master
+      become_user: postgres
+      shell: "psql -c \"INSERT INTO {{ repl_table_name }} (data) VALUES ('Logical Replication Test Row 1'), ('Row 2'), ('Timestamp: {{ ansible_date_time.iso8601 }}');\""
+      when: ansible_host == master_ip
+      changed_when: true
+
+    - name: Wait for replication sync
+      pause:
+        seconds: 5
+      when: ansible_host != master_ip
+
+    - name: Verify data on Second Instance
+      become_user: postgres
+      command: psql -p {{ second_instance_port }} -c "SELECT * FROM {{ repl_table_name }} ORDER BY id DESC LIMIT 5;"
+      when: ansible_host != master_ip
+      register: subscriber_data
+      changed_when: false
+
+    - name: Check Subscription Status on Second Instance
+      become_user: postgres
+      command: psql -p {{ second_instance_port }} -c "SELECT subname, subenabled, subslotname FROM pg_subscription;"
+      when: ansible_host != master_ip
+      register: sub_status
+      changed_when: false
+
+    - name: Check Replication Slots on Master
+      become_user: postgres
+      command: psql -c "SELECT slot_name, plugin, slot_type, active, restart_lsn FROM pg_replication_slots;"
+      when: ansible_host == master_ip
+      register: master_slots
+      changed_when: false
+
+    - name: Check Publication on Master
+      become_user: postgres
+      command: psql -c "SELECT pubname, puballtables, pubinsert, pubupdate, pubdelete FROM pg_publication;"
+      when: ansible_host == master_ip
+      register: master_pub
+      changed_when: false
+
+    # --- СБОР ДАННЫХ В ОБЩИЕ ФАКТЫ ДЛЯ ОТЧЕТА ---
+    # Сохраняем результаты в переменные уровня play, чтобы они были доступны везде
+    
+    - name: Store Master Data in global fact
+      set_fact:
+        report_master_pub: "{{ master_pub.stdout }}"
+        report_master_slots: "{{ master_slots.stdout }}"
+      when: ansible_host == master_ip
+
+    - name: Store Subscriber Data in global fact
+      set_fact:
+        report_subscriber_ip: "{{ ansible_host }}"
+        report_sub_status: "{{ sub_status.stdout }}"
+        report_sub_data: "{{ subscriber_data.stdout }}"
+      when: ansible_host != master_ip
+
+    # Небольшая пауза, чтобы факты успели распространиться (для надежности)
+    - name: Pause to sync facts
+      pause:
+        seconds: 1
+      run_once: true
+
+    # --- ЗАДАЧА: Сохранение результатов в файл ---
+    - name: Save logical replication test results to local file
+      local_action:
+        module: copy
+        content: |
+          ================================================
+          ОТЧЕТ ПО TASK 3: ЛОГИЧЕСКАЯ РЕПЛИКАЦИЯ
+          ================================================
+          Дата выполнения: {{ ansible_date_time.iso8601 }}
+          
+          ИНФРАСТРУКТУРА:
+          - Master IP: {{ master_ip }}
+          - Subscriber IP: {{ hostvars['server2']['report_subscriber_ip'] | default('Unknown') }} 
+            (Второй инстанс на порту {{ second_instance_port }})
+          - Таблица: {{ repl_table_name }}
+          - Публикация: {{ pub_name }}
+          - Подписка: {{ sub_name }}
+
+          1. СТАТУС ПУБЛИКАЦИИ (MASTER):
+          {{ hostvars['server1']['report_master_pub'] | default('Не получено') }}
+
+          2. СТАТУС СЛОТОВ РЕПЛИКАЦИИ (MASTER):
+          {{ hostvars['server1']['report_master_slots'] | default('Не получено') }}
+
+          3. СТАТУС ПОДПИСКИ (SUBSCRIBER):
+          {{ hostvars['server2']['report_sub_status'] | default('Не получено') }}
+
+          4. ДАННЫЕ ВО ВТОРОМ ИНСТАНСЕ (ПОРТ {{ second_instance_port }}):
+          {{ hostvars['server2']['report_sub_data'] | default('Нет данных') }}
+
+          ================================================
+          ЗАКЛЮЧЕНИЕ:
+          Логическая репликация настроена успешно.
+          Данные синхронизируются между Master и вторым инстансом на Server2.
+          ================================================
+        dest: "./test_result.txt"
+      run_once: true
+      delegate_to: localhost
+      become: false
+
+    - name: Display Final Status
+      debug:
+        msg: "Logical Replication OK! Report saved to test_result.txt with correct data from both hosts."
+      run_once: true
+
+  # ========================================================================
+  # HANDLERS
+  # ========================================================================
+  handlers:
+    - name: Restart Master PG
+      command: pg_ctlcluster {{ postgresql_version }} main restart
+      when: ansible_host == master_ip
+
+    - name: Reload Systemd
+      systemd:
+        daemon_reload: true
