@@ -1,0 +1,176 @@
+---
+- name: Task 2. Setup Streaming Replication
+  hosts: postgres_servers
+  become: true
+  vars:
+    postgresql_version: "16"
+    pg_data_dir: "/pg_data/16"
+    pg_conf_dir: "/etc/postgresql/{{ postgresql_version }}/main"
+    replication_user: "replicator"
+    # Пароль должен совпадать с тем, что был создан в Task_1
+    replication_password: "123" 
+    master_ip: "192.168.122.19" # IP адрес Server1
+
+  tasks:
+    # ========================================================================
+    # ЧАСТЬ 1: Настройка MASTER (Server1)
+    # Выполняется только на сервере с IP master_ip
+    # ========================================================================
+    
+    - name: Configure Master for replication (postgresql.conf)
+      lineinfile:
+        path: "{{ pg_conf_dir }}/postgresql.conf"
+        regexp: "^#?{{ item.param }}"
+        line: "{{ item.param }} = {{ item.value }}"
+        state: present
+      loop:
+        - { param: 'wal_level', value: "'replica'" }
+        - { param: 'max_wal_senders', value: '10' }
+        - { param: 'wal_keep_size', value: '1GB' }
+        - { param: 'hot_standby', value: 'on' }
+        - { param: 'hot_standby_feedback', value: 'on' }
+      when: ansible_host == master_ip
+      notify: Restart PostgreSQL Master
+
+    - name: Ensure replication user exists on Master
+      become_user: postgres
+      command: >
+        psql -c "SELECT 1 FROM pg_roles WHERE rolname='{{ replication_user }}' AND rolreplication=true;"
+      register: repl_user_check
+      changed_when: false
+      failed_when: false
+      when: ansible_host == master_ip
+
+    - name: Create replication user if not exists
+      become_user: postgres
+      command: >
+        psql -c "CREATE USER {{ replication_user }} WITH REPLICATION ENCRYPTED PASSWORD '{{ replication_password }}';"
+      when: 
+        - ansible_host == master_ip
+        - repl_user_check.rc != 0 or repl_user_check.stdout == ""
+
+    - name: Ensure pg_hba.conf allows replication from replica
+      blockinfile:
+        path: "{{ pg_conf_dir }}/pg_hba.conf"
+        marker: "# {mark} ANSIBLE REPLICATION TASK2"
+        block: |
+          # Allow replication from specific replica IP
+          host    replication     {{ replication_user }}    {{ ansible_host }}/32       scram-sha-256
+          host    replication     {{ replication_user }}    192.168.122.0/24            scram-sha-256
+      when: ansible_host == master_ip
+      notify: Reload PostgreSQL Master
+
+    # ========================================================================
+    # ЧАСТЬ 2: Настройка REPLICA (Server2)
+    # Выполняется только на сервере, который НЕ является master_ip
+    # ========================================================================
+
+    - name: Stop PostgreSQL on Replica
+      systemd:
+        name: postgresql
+        state: stopped
+      when: ansible_host != master_ip
+      ignore_errors: true
+
+    - name: Clean old data directory on Replica
+      file:
+        path: "{{ pg_data_dir }}"
+        state: absent
+      when: ansible_host != master_ip
+
+    - name: Recreate data directory on Replica
+      file:
+        path: "{{ pg_data_dir }}"
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0700'
+      when: ansible_host != master_ip
+
+    - name: Run pg_basebackup from Master
+      become_user: postgres
+      command: >
+        pg_basebackup -h {{ master_ip }} -U {{ replication_user }} -D {{ pg_data_dir }} -Fp -Xs -P -R
+      environment:
+        PGPASSWORD: "{{ replication_password }}"
+      when: ansible_host != master_ip
+      register: basebackup_result
+      # -Fp: формат plain
+      # -Xs: стримить WAL во время бэкапа
+      # -P: прогресс бар
+      # -R: создать standby.signal и настроить primary_conninfo автоматически
+
+    - name: Verify standby.signal exists
+      stat:
+        path: "{{ pg_data_dir }}/standby.signal"
+      register: signal_file
+      when: ansible_host != master_ip
+
+    - name: Fail if standby.signal not created
+      fail:
+        msg: "Replication setup failed: standby.signal not found. Check pg_basebackup logs."
+      when: 
+        - ansible_host != master_ip
+        - not signal_file.stat.exists
+
+    - name: Start PostgreSQL on Replica
+      systemd:
+        name: postgresql
+        state: started
+        enabled: true
+      when: ansible_host != master_ip
+
+    - name: Wait for Replica to be ready
+      wait_for:
+        port: 5432
+        timeout: 60
+      when: ansible_host != master_ip
+
+    # ========================================================================
+    # ЧАСТЬ 3: Проверка репликации
+    # Выполняется на Master
+    # ========================================================================
+
+    - name: Check replication status on Master
+      become_user: postgres
+      command: psql -c "SELECT client_addr, state, sent_lsn, write_lsn, flush_lsn, replay_lsn FROM pg_stat_replication;"
+      register: repl_status
+      when: ansible_host == master_ip
+      changed_when: false
+
+    - name: Display Replication Status
+      debug:
+        var: repl_status.stdout_lines
+      when: ansible_host == master_ip
+
+    - name: Test Replication (Create table on Master)
+      become_user: postgres
+      command: psql -c "CREATE TABLE IF NOT EXISTS repl_test (id serial PRIMARY KEY, created_at timestamp default now()); INSERT INTO repl_test DEFAULT VALUES;"
+      when: ansible_host == master_ip
+      changed_when: true
+
+    - name: Wait for replication lag
+      pause:
+        seconds: 2
+      when: ansible_host != master_ip
+
+    - name: Verify data on Replica
+      become_user: postgres
+      command: psql -c "SELECT count(*) FROM repl_test;"
+      register: replica_check
+      when: ansible_host != master_ip
+      changed_when: false
+
+    - name: Display Replica Verification
+      debug:
+        msg: "Replication OK! Found {{ replica_check.stdout }} rows on replica."
+      when: ansible_host != master_ip
+
+  handlers:
+    - name: Restart PostgreSQL Master
+      command: pg_ctlcluster {{ postgresql_version }} main restart
+      when: ansible_host == master_ip
+
+    - name: Reload PostgreSQL Master
+      command: pg_ctlcluster {{ postgresql_version }} main reload
+      when: ansible_host == master_ip
