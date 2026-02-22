@@ -216,6 +216,7 @@ Velikiy_Flask/
 ├── docker-compose.yml      # Оркестрация контейнеров
 ├── Dockerfile              # Сборка образа Flask
 ├── .env                    # Переменные окружения (порты, пароли)
+├── .gitignore              # Запрет на комит .env для аля безопасности 
 ├── init.sql                # Скрипт инициализации БД (создание таблиц)
 ├── requirements.txt        # Python зависимости
 ├── app.py                  # Исходный код приложения (Flask + Logic)
